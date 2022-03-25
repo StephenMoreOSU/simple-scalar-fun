@@ -25,6 +25,14 @@
 #include "dlite.h"
 #include "sim.h"
 
+
+/* total input dependencies possible */
+#define MAX_IDEPS               3
+
+/* total output dependencies possible */
+#define MAX_ODEPS               2
+
+struct RUU_station;
 /*
  * This file implements a very detailed out-of-order issue superscalar
  * processor with a two-level memory system and speculative execution support.
@@ -41,17 +49,36 @@ static counter_t regs_num_0_deps[MD_TOTAL_REGS];
 static counter_t regs_num_1_deps[MD_TOTAL_REGS];
 static counter_t regs_num_2_deps[MD_TOTAL_REGS];
 
+
+//If the input dependancy is ready the value will be 1, else it will be 0
+// typedef struct {
+// 	int in0_dep,in1_dep,in2_dep;
+// } input_deps;
+
 typedef struct {
-	int in0_dep,in1_dep,in2_dep;
-} input_deps;
+	int ideps[MAX_IDEPS];
+	md_addr_t PC;
+	int last_tag_pred;
+	u_int16_t tag_buf_addr;
+} rs_tracker;
 
-static input_deps in_deps;
+#define GCH_SZ 8
+#define NRS_TRACKERS 200
+#define NTAG_PRED_ROWS 0x4000
+static int gch_buf[GCH_SZ];
 
+static int input_deps[NRS_TRACKERS][MAX_IDEPS];
+static rs_tracker rs_trackers[NRS_TRACKERS];
+// static int last_tag_preds[]
+static int rs_track_idx = 0;
+
+static int tag_pred_buf[NTAG_PRED_ROWS]; //start by randomizing value, 0->strong L,1->weak L,2-> weak R, 3-> strong R. 
+static int pred_last_tag;
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////////////
 ///// LSQH SUPPORT ADD ME
 ///////////////////////////////////////////////////////////////////////////////////////////////////////////
-struct RUU_station;
+
 #define LSQH_DEBUG      0
 // uncomment the following for NO MEMORY DEPENDENCE SPECULATION
 // comment the following for PERFECT MEMORY DEPENDENCE SPECULATION
@@ -61,6 +88,29 @@ struct RUU_station;
 
 //my stuff
 void update_in_deps(struct RUU_station *rs);
+void init_tag_pred_buf(void);
+int decode_tag_buf(int tag_idx);
+
+int decode_tag_buf(int tag_idx)
+{
+	if(tag_pred_buf[tag_idx] > 1)
+		return 1; //R
+	else
+		return 0; //L
+}
+void init_tag_pred_buf()
+{
+
+	time_t t;
+	srand((unsigned) time(&t));
+	int i;
+	for(i=0;i<NTAG_PRED_ROWS;i++)
+	{
+		tag_pred_buf[i] = rand() % 4;
+	}
+}
+// void predict_last_tag();
+
 
 void
 lsqh_create (int entries);
@@ -1548,12 +1598,6 @@ typedef unsigned int INST_TAG_TYPE;
 typedef unsigned int INST_SEQ_TYPE;
 
 
-/* total input dependencies possible */
-#define MAX_IDEPS               3
-
-/* total output dependencies possible */
-#define MAX_ODEPS               2
-
 /* a register update unit (RUU) station, this record is contained in the
    processors RUU, which serves as a collection of ordered reservations
    stations.  The reservation stations capture register results and await
@@ -2666,29 +2710,63 @@ ruu_writeback(void)
 
 		      /* input is now ready */
 		      olink->rs->idep_ready[olink->x.opnum] = TRUE;
-
+				printf("rs:%x, PC:%x\n",olink->rs,olink->rs->PC);
 		      /* are all the register operands of target ready? */
 		      if (OPERANDS_READY(olink->rs))
-			{
-			  /* yes! enqueue instruction as ready, NOTE: stores
-			     complete at dispatch, so no need to enqueue
-			     them */
-			  if (!olink->rs->in_LSQ
-			      || ((MD_OP_FLAGS(olink->rs->op)&(F_MEM|F_STORE))
-				  == (F_MEM|F_STORE)))
-			    readyq_enqueue(olink->rs);
-///////////////////////////////////////////////////////////////////////////////////////////////////////////
-///// LSQH SUPPORT ADD ME
-///////////////////////////////////////////////////////////////////////////////////////////////////////////
-                          // post mem op --> if store it will wakeup loads / if load it will scan for matching store and wakeup itself
-                          if (olink->rs->in_LSQ)
-                                lsqh_ruu_post (olink->rs);
-///////////////////////////////////////////////////////////////////////////////////////////////////////////
-///// LSQH SUPPORT ADD ME - LSQHEND
-///////////////////////////////////////////////////////////////////////////////////////////////////////////
+				{
+				/* yes! enqueue instruction as ready, NOTE: stores
+					complete at dispatch, so no need to enqueue
+					them */
+				if (!olink->rs->in_LSQ
+					|| ((MD_OP_FLAGS(olink->rs->op)&(F_MEM|F_STORE))
+					== (F_MEM|F_STORE)))
+					readyq_enqueue(olink->rs);
+	///////////////////////////////////////////////////////////////////////////////////////////////////////////
+	///// LSQH SUPPORT ADD ME
+	///////////////////////////////////////////////////////////////////////////////////////////////////////////
+							// post mem op --> if store it will wakeup loads / if load it will scan for matching store and wakeup itself
+							if (olink->rs->in_LSQ)
+									lsqh_ruu_post (olink->rs);
+	///////////////////////////////////////////////////////////////////////////////////////////////////////////
+	///// LSQH SUPPORT ADD ME - LSQHEND
+	///////////////////////////////////////////////////////////////////////////////////////////////////////////
 
-			  /* else, ld op, issued when no mem conflict */
-			}
+				/* else, ld op, issued when no mem conflict */
+				}
+				else
+				{
+					//determine which of the rs trackers has the same PC
+					int rs_tracker_it;
+					for(rs_tracker_it=0;rs_tracker_it<NRS_TRACKERS;rs_tracker_it++)
+					{	
+						if(rs_trackers[rs_tracker_it].PC == olink->rs->PC)
+							break;
+					}
+					//check to see if the last tag predictor was correct
+					int j;
+					int true_last_tag;
+					int l_resolved_flag = 0;
+
+					for(j=0;j<2;j++)
+					{
+						// if(rs_trackers[rs_tracker_it].ideps[j] == 0)
+						// 	l_resolved_flag = 1;
+						//find the most recently resolved dependancy
+						if(olink->rs->idep_ready[j] != rs_trackers[rs_tracker_it].ideps[j])
+						{
+							//if L was resolved first
+							if(j == 0)
+								true_last_tag = 1; //RIGHT
+							else if(j == 1)
+								true_last_tag = 0; //LEFT
+							else
+								panic("dep should be resolved but it isnt!?!?!?!");
+						}
+					} 
+					//update last tag predictor
+
+					printf("ONLY ONE OPERAND READY AFTER THIS\n");
+				}
 		    }
 
 		  /* grab link to next element prior to free */
@@ -4686,7 +4764,20 @@ ruu_dispatch(void)
 		}
 		else
 		{
-			global_num_2_deps++;
+			//save the current rs->ideps, predict the last tag
+			// int idep_num;
+			// for(idep_num=0;idep_num<MAX_IDEPS;idep_num++)
+			// {
+			// 	input_deps[inst_idep_idx][idep_num] = rs->idep_ready[idep_num];
+			// }
+			// printf("%x\n",rs);
+			// //last tag prediction
+			// u_int32_t cur_PC = (u_int32_t) rs->PC;
+			// u_int16_t tag_pred_addr;
+			// cur_PC &= 0x3FFFFFFC; //set 2 MSBs 2 LSBs to 0
+			// cur_PC >>= 2; //remove 2 LSBs leaving 28 bits left
+			// tag_pred_addr = (cur_PC >> 14 ) ^ (cur_PC & 0x00003FFF); //shift 28 bits to the left to get 14 MSBs and 14 LSBs, XOR together to get addr hash
+			// global_num_2_deps++;
 		}
 	      /* issue may continue when the load/store is issued */
 	      RSLINK_INIT(last_op, lsq);
@@ -4744,7 +4835,35 @@ ruu_dispatch(void)
 		}
 	      else
 		{
-		  global_num_2_deps++;
+			//save the current rs->ideps, predict the last tag
+			// int idep_num;
+			// for(idep_num=0;idep_num<MAX_IDEPS;idep_num++)
+			// {
+			// 	input_deps[inst_idep_idx][idep_num] = rs->idep_ready[idep_num];
+			// }
+			
+			printf("dispatch-> rs:%x PC:%x\n",rs,rs->PC);
+			// int i;
+			// for(i=0;i<3;i++)
+			// {
+			// 	printf("idep[%d]:%d\n",i,rs->idep_ready[i]);
+			// }
+			// printf("\n");
+			//save a copy of reservation station in question
+			int idep_num;
+			for(idep_num=0;idep_num<MAX_IDEPS;idep_num++)
+				rs_trackers[rs_track_idx].ideps[idep_num] = rs->idep_ready[idep_num];
+			rs_trackers[rs_track_idx].PC = rs->PC;
+			//last tag prediction
+			u_int32_t cur_PC = (u_int32_t) rs->PC;
+			u_int16_t tag_pred_addr;
+			cur_PC &= 0x3FFFFFFC; //set 2 MSBs 2 LSBs to 0
+			cur_PC >>= 2; //remove 2 LSBs leaving 28 bits left
+			tag_pred_addr = (cur_PC >> 14 ) ^ (cur_PC & 0x00003FFF); //shift 28 bits to the left to get 14 MSBs and 14 LSBs, XOR together to get addr hash
+			rs_trackers[rs_track_idx].tag_buf_addr = tag_pred_addr;
+			rs_trackers[rs_track_idx].last_tag_pred = decode_tag_buf(tag_pred_addr);
+			rs_track_idx++;
+			global_num_2_deps++;
 		  /* could not issue this inst, stall issue until we can */
 		  RSLINK_INIT(last_op, rs);
 		}
@@ -5146,6 +5265,7 @@ simoo_mstate_obj(FILE *stream,			/* output stream */
 void
 sim_main(void)
 {
+	init_tag_pred_buf();
 ///////////////////////////////////////////////////////////////////////////////////////////////////////////
 ///// LSQH SUPPORT ADD ME
 ///////////////////////////////////////////////////////////////////////////////////////////////////////////
