@@ -45,10 +45,12 @@ static counter_t global_num_0_deps;
 static counter_t global_num_1_deps;
 static counter_t global_num_2_deps;
 
+static counter_t nlast_tag_preds;
+static counter_t ncorrect_tag_preds;
+
 static counter_t regs_num_0_deps[MD_TOTAL_REGS];
 static counter_t regs_num_1_deps[MD_TOTAL_REGS];
 static counter_t regs_num_2_deps[MD_TOTAL_REGS];
-
 
 //If the input dependancy is ready the value will be 1, else it will be 0
 // typedef struct {
@@ -62,9 +64,27 @@ typedef struct {
 	u_int16_t tag_buf_addr;
 } rs_tracker;
 
+typedef struct{
+	md_addr_t PC;
+	counter_t freq;
+} PC_info;
+
+int compare(const void *s1, const void *s2)
+{
+  PC_info *e1 = (PC_info *)s1;
+  PC_info *e2 = (PC_info *)s2;
+//   int gendercompare = strcmp(e1->gender, e2->gender);
+    return e2->freq - e1->freq;
+}
+
 #define GCH_SZ 8
 #define NRS_TRACKERS 200
 #define NTAG_PRED_ROWS 0x4000
+#define PC_HIST_SZ 20
+
+static PC_info PC_history[NTAG_PRED_ROWS];
+static int pc_history_idx = 0;
+
 static int gch_buf[GCH_SZ];
 
 static int input_deps[NRS_TRACKERS][MAX_IDEPS];
@@ -90,7 +110,17 @@ static int pred_last_tag;
 void update_in_deps(struct RUU_station *rs);
 void init_tag_pred_buf(void);
 int decode_tag_buf(int tag_idx);
+void update_tag_buf(u_int16_t tag_buf_addr_ptr, int update_flag);
 
+
+void init_pc_hist(void)
+{
+	int i;
+	for(i=0;i<NTAG_PRED_ROWS;i++)
+	{
+		PC_history[i].PC = 0;
+	}
+}
 int decode_tag_buf(int tag_idx)
 {
 	if(tag_pred_buf[tag_idx] > 1)
@@ -106,9 +136,26 @@ void init_tag_pred_buf()
 	int i;
 	for(i=0;i<NTAG_PRED_ROWS;i++)
 	{
-		tag_pred_buf[i] = rand() % 4;
+		tag_pred_buf[i] = 0;//rand() % 4;
 	}
 }
+
+void update_tag_buf(u_int16_t tag_buf_addr_ptr, int update_flag)
+{
+	//increment and saturate at 3
+	if(update_flag)
+	{
+		if(tag_pred_buf[tag_buf_addr_ptr] < 3)
+			tag_pred_buf[tag_buf_addr_ptr]++;
+	}
+	//decrement and saturate at 0
+	else
+	{
+		if(tag_pred_buf[tag_buf_addr_ptr] > 0)	
+			tag_pred_buf[tag_buf_addr_ptr]--;
+	}
+}
+
 // void predict_last_tag();
 
 
@@ -1324,6 +1371,9 @@ sim_reg_stats(struct stat_sdb_t *sdb)   /* stats database */
 	stat_reg_counter(sdb, "global_num_2_deps",
 		"total number instructions waiting on 2 dependancies",
 		&global_num_2_deps, global_num_2_deps, NULL);
+	// stat_reg_formula(sdb, "last_tag_pred_accuracy",
+	// 	"percentage of correct last tag predictions",
+	// 	"ncorrect_tag_preds / global_num_2_deps",NULL);
   /* register baseline stats */
   stat_reg_counter(sdb, "sim_num_insn",
 		   "total number of instructions committed",
@@ -2708,9 +2758,33 @@ ruu_writeback(void)
 		      if (olink->rs->idep_ready[olink->x.opnum])
 			panic("output dependence already satisfied");
 
+			//check to see if there are two operands that arent ready, if so predict the last tag between them
+			if(olink->rs->idep_ready[0] == 0 && olink->rs->idep_ready[1] == 0)
+			{
+				if(olink->rs->PC == 0x402ac0)
+					printf("corner case investigate pre verify\n");
+				int idep_num;
+				for(idep_num=0;idep_num<MAX_IDEPS;idep_num++)
+					rs_trackers[rs_track_idx].ideps[idep_num] = olink->rs->idep_ready[idep_num];
+				rs_trackers[rs_track_idx].PC = olink->rs->PC;
+				//last tag prediction
+				u_int32_t cur_PC = (u_int32_t) olink->rs->PC;
+				u_int16_t tag_pred_addr;
+				cur_PC &= 0x3FFFFFFC; //set 2 MSBs 2 LSBs to 0
+				cur_PC >>= 2; //remove 2 LSBs leaving 28 bits left
+				tag_pred_addr = (cur_PC >> 14 ) ^ (cur_PC & 0x00003FFF); //shift 28 bits to the left to get 14 MSBs and 14 LSBs, XOR together to get addr hash
+				printf("tag_pred_addr: %x\n",tag_pred_addr);
+				rs_trackers[rs_track_idx].tag_buf_addr = tag_pred_addr;
+				rs_trackers[rs_track_idx].last_tag_pred = decode_tag_buf(tag_pred_addr);
+				printf("2_dep found: rs:%x, PC:%x\n",olink->rs,olink->rs->PC);
+			}
+			else
+				printf("less than 2_dep found: rs:%x, PC:%x\n",olink->rs,olink->rs->PC);
+				if(olink->rs->PC == 0x402ac0)
+					printf("corner case investigate pre verify\n");
+
 		      /* input is now ready */
 		      olink->rs->idep_ready[olink->x.opnum] = TRUE;
-				printf("rs:%x, PC:%x\n",olink->rs,olink->rs->PC);
 		      /* are all the register operands of target ready? */
 		      if (OPERANDS_READY(olink->rs))
 				{
@@ -2735,37 +2809,73 @@ ruu_writeback(void)
 				}
 				else
 				{
-					//determine which of the rs trackers has the same PC
-					int rs_tracker_it;
-					for(rs_tracker_it=0;rs_tracker_it<NRS_TRACKERS;rs_tracker_it++)
-					{	
-						if(rs_trackers[rs_tracker_it].PC == olink->rs->PC)
-							break;
-					}
-					//check to see if the last tag predictor was correct
-					int j;
-					int true_last_tag;
-					int l_resolved_flag = 0;
-
-					for(j=0;j<2;j++)
+					//if(global_num_2_deps > nlast_tag_preds)
 					{
-						// if(rs_trackers[rs_tracker_it].ideps[j] == 0)
-						// 	l_resolved_flag = 1;
-						//find the most recently resolved dependancy
-						if(olink->rs->idep_ready[j] != rs_trackers[rs_tracker_it].ideps[j])
-						{
-							//if L was resolved first
-							if(j == 0)
-								true_last_tag = 1; //RIGHT
-							else if(j == 1)
-								true_last_tag = 0; //LEFT
-							else
-								panic("dep should be resolved but it isnt!?!?!?!");
+						//determine which of the rs trackers has the same PC
+						int rs_tracker_it;
+						for(rs_tracker_it=0;rs_tracker_it<NRS_TRACKERS;rs_tracker_it++)
+						{	
+							if(rs_trackers[rs_tracker_it].PC == olink->rs->PC)
+								break;
 						}
-					} 
-					//update last tag predictor
+						if(rs_trackers[0].PC != olink->rs->PC)
+							printf("unusual case: rs:%x, PC:%x\n",olink->rs,olink->rs->PC);
+						//check to see if the last tag predictor was correct
+						int j;
+						int true_last_tag;
+						int l_resolved_flag = 0;
 
-					printf("ONLY ONE OPERAND READY AFTER THIS\n");
+						for(j=0;j<2;j++)
+						{
+							// if(rs_trackers[rs_tracker_it].ideps[j] == 0)
+							// 	l_resolved_flag = 1;
+							//find the most recently resolved dependancy
+							if(olink->rs->idep_ready[j] != rs_trackers[rs_tracker_it].ideps[j])
+							{
+								//if L was resolved first
+								if(j == 0)
+									true_last_tag = 1; //RIGHT
+								else if(j == 1)
+									true_last_tag = 0; //LEFT
+								else
+									panic("dep should be resolved but it isnt!?!?!?!");
+								break;
+							}
+						} 
+
+						
+						for(j=0;j<NTAG_PRED_ROWS;j++)
+						{
+							if(PC_history[j].PC == 0)
+							{
+								PC_history[i].PC = olink->rs->PC;
+								PC_history[i].freq++;	
+								qsort(PC_history, NTAG_PRED_ROWS, sizeof(PC_info), compare);
+								break;
+							}
+						}
+						
+
+						//update last tag predictor
+						// for(j=0;j<NTAG_PRED_ROWS;j++)
+						// {
+							
+
+						// }
+
+
+						//was the tag correct?
+						if(rs_trackers[rs_tracker_it].last_tag_pred == true_last_tag)
+							ncorrect_tag_preds++; //update accuracy of predictor
+						nlast_tag_preds++;
+						update_tag_buf(rs_trackers[rs_tracker_it].tag_buf_addr, true_last_tag);					
+						if(rs_trackers[rs_tracker_it].tag_buf_addr == 0xd8)
+							printf("testcase\n");
+						//tag_pred_buf ENDED HERE
+						float avg_accuracy = (float) ncorrect_tag_preds / (float) nlast_tag_preds;
+						printf("Running avg of %f\n", avg_accuracy);
+						printf("Most freq PC: %x, freq:%d\n", PC_history[0].PC, PC_history[0].freq);
+					}
 				}
 		    }
 
@@ -4842,7 +4952,7 @@ ruu_dispatch(void)
 			// 	input_deps[inst_idep_idx][idep_num] = rs->idep_ready[idep_num];
 			// }
 			
-			printf("dispatch-> rs:%x PC:%x\n",rs,rs->PC);
+			printf("dispatch-> rs:%x\tPC:%x\t",rs,rs->PC);
 			// int i;
 			// for(i=0;i<3;i++)
 			// {
@@ -4850,7 +4960,8 @@ ruu_dispatch(void)
 			// }
 			// printf("\n");
 			//save a copy of reservation station in question
-			int idep_num;
+			
+			/*int idep_num;
 			for(idep_num=0;idep_num<MAX_IDEPS;idep_num++)
 				rs_trackers[rs_track_idx].ideps[idep_num] = rs->idep_ready[idep_num];
 			rs_trackers[rs_track_idx].PC = rs->PC;
@@ -4860,9 +4971,13 @@ ruu_dispatch(void)
 			cur_PC &= 0x3FFFFFFC; //set 2 MSBs 2 LSBs to 0
 			cur_PC >>= 2; //remove 2 LSBs leaving 28 bits left
 			tag_pred_addr = (cur_PC >> 14 ) ^ (cur_PC & 0x00003FFF); //shift 28 bits to the left to get 14 MSBs and 14 LSBs, XOR together to get addr hash
+			printf("tag_pred_addr: %x\n",tag_pred_addr);
 			rs_trackers[rs_track_idx].tag_buf_addr = tag_pred_addr;
 			rs_trackers[rs_track_idx].last_tag_pred = decode_tag_buf(tag_pred_addr);
-			rs_track_idx++;
+			*/
+
+			//rs_track_idx++;
+			//rs_track_idx %= NRS_TRACKERS;
 			global_num_2_deps++;
 		  /* could not issue this inst, stall issue until we can */
 		  RSLINK_INIT(last_op, rs);
@@ -5266,6 +5381,7 @@ void
 sim_main(void)
 {
 	init_tag_pred_buf();
+	init_pc_hist();
 ///////////////////////////////////////////////////////////////////////////////////////////////////////////
 ///// LSQH SUPPORT ADD ME
 ///////////////////////////////////////////////////////////////////////////////////////////////////////////
