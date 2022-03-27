@@ -86,6 +86,9 @@ static PC_info PC_history[NTAG_PRED_ROWS];
 static int pc_history_idx = 0;
 
 static int gch_buf[GCH_SZ];
+static int gch_index = 0;
+
+static unsigned char gch_val = 0;
 
 static int input_deps[NRS_TRACKERS][MAX_IDEPS];
 static rs_tracker rs_trackers[NRS_TRACKERS];
@@ -112,7 +115,12 @@ void init_tag_pred_buf(void);
 int decode_tag_buf(int tag_idx);
 void update_tag_buf(u_int16_t tag_buf_addr_ptr, int update_flag);
 
-
+void init_gch_buf(void)
+{
+	int i;
+	for(i=0;i<GCH_SZ;i++)
+		gch_buf[i] = 0;
+}
 void init_pc_hist(void)
 {
 	int i;
@@ -2495,6 +2503,26 @@ ruu_commit(void)
                        /* opcode */rs->op,
                        /* dir predictor update pointer */&rs->dir_update);
 	}
+	  //this will save the last 8 entries of branch predictions and use them to hash the last tag predictor
+	int branch_taken = (rs->next_PC != (rs->PC + sizeof(md_inst_t)));
+	if(gch_index<GCH_SZ)
+	{
+
+		gch_buf[gch_index] = (rs->pred_PC == rs->next_PC);
+		gch_val |= (branch_taken << gch_index);
+		gch_index++;
+	}
+	else
+	{
+		gch_val <<= 1;
+		gch_val |= branch_taken;
+		int j;
+		for(j=0;j<GCH_SZ-1;j++)
+			gch_buf[j+1] = gch_buf[j];
+		gch_buf[0] = (rs->pred_PC == rs->next_PC);
+	}
+
+
 
       /* invalidate RUU operation instance */
       RUU[RUU_head].tag++;
@@ -2704,6 +2732,7 @@ ruu_writeback(void)
 		       /* dir predictor update pointer */&rs->dir_update);
 	}
 
+
       /* entered writeback stage, indicate in pipe trace */
       ptrace_newstage(rs->ptrace_seq, PST_WRITEBACK,
 		      rs->recover_inst ? PEV_MPDETECT : 0);
@@ -2761,8 +2790,8 @@ ruu_writeback(void)
 			//check to see if there are two operands that arent ready, if so predict the last tag between them
 			if(olink->rs->idep_ready[0] == 0 && olink->rs->idep_ready[1] == 0)
 			{
-				if(olink->rs->PC == 0x402ac0)
-					printf("corner case investigate pre verify\n");
+				// if(olink->rs->PC == 0x402ac0)
+				// 	printf("corner case investigate pre verify\n");
 				int idep_num;
 				for(idep_num=0;idep_num<MAX_IDEPS;idep_num++)
 					rs_trackers[rs_track_idx].ideps[idep_num] = olink->rs->idep_ready[idep_num];
@@ -2773,15 +2802,16 @@ ruu_writeback(void)
 				cur_PC &= 0x3FFFFFFC; //set 2 MSBs 2 LSBs to 0
 				cur_PC >>= 2; //remove 2 LSBs leaving 28 bits left
 				tag_pred_addr = (cur_PC >> 14 ) ^ (cur_PC & 0x00003FFF); //shift 28 bits to the left to get 14 MSBs and 14 LSBs, XOR together to get addr hash
-				printf("tag_pred_addr: %x\n",tag_pred_addr);
+				tag_pred_addr ^= gch_val;
+				//printf("tag_pred_addr: %x\n",tag_pred_addr);
 				rs_trackers[rs_track_idx].tag_buf_addr = tag_pred_addr;
 				rs_trackers[rs_track_idx].last_tag_pred = decode_tag_buf(tag_pred_addr);
-				printf("2_dep found: rs:%x, PC:%x\n",olink->rs,olink->rs->PC);
+				
+				//printf("2_dep found: rs:%x, PC:%x\n",olink->rs,olink->rs->PC);
 			}
-			else
-				printf("less than 2_dep found: rs:%x, PC:%x\n",olink->rs,olink->rs->PC);
-				if(olink->rs->PC == 0x402ac0)
-					printf("corner case investigate pre verify\n");
+				// printf("less than 2_dep found: rs:%x, PC:%x\n",olink->rs,olink->rs->PC);
+				// if(olink->rs->PC == 0x402ac0)
+				// 	printf("corner case investigate pre verify\n");
 
 		      /* input is now ready */
 		      olink->rs->idep_ready[olink->x.opnum] = TRUE;
@@ -2818,8 +2848,8 @@ ruu_writeback(void)
 							if(rs_trackers[rs_tracker_it].PC == olink->rs->PC)
 								break;
 						}
-						if(rs_trackers[0].PC != olink->rs->PC)
-							printf("unusual case: rs:%x, PC:%x\n",olink->rs,olink->rs->PC);
+						//if(rs_trackers[0].PC != olink->rs->PC)
+						//	printf("unusual case: rs:%x, PC:%x\n",olink->rs,olink->rs->PC);
 						//check to see if the last tag predictor was correct
 						int j;
 						int true_last_tag;
@@ -2869,12 +2899,12 @@ ruu_writeback(void)
 							ncorrect_tag_preds++; //update accuracy of predictor
 						nlast_tag_preds++;
 						update_tag_buf(rs_trackers[rs_tracker_it].tag_buf_addr, true_last_tag);					
-						if(rs_trackers[rs_tracker_it].tag_buf_addr == 0xd8)
-							printf("testcase\n");
+						//if(rs_trackers[rs_tracker_it].tag_buf_addr == 0xd8)
+						//	printf("testcase\n");
 						//tag_pred_buf ENDED HERE
 						float avg_accuracy = (float) ncorrect_tag_preds / (float) nlast_tag_preds;
 						printf("Running avg of %f\n", avg_accuracy);
-						printf("Most freq PC: %x, freq:%d\n", PC_history[0].PC, PC_history[0].freq);
+						//printf("Most freq PC: %x, freq:%d\n", PC_history[0].PC, PC_history[0].freq);
 					}
 				}
 		    }
@@ -5380,6 +5410,7 @@ simoo_mstate_obj(FILE *stream,			/* output stream */
 void
 sim_main(void)
 {
+	init_gch_buf();
 	init_tag_pred_buf();
 	init_pc_hist();
 ///////////////////////////////////////////////////////////////////////////////////////////////////////////
